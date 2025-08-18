@@ -16,6 +16,10 @@
 (define-constant ERR-EXPENSE-NOT-FOUND (err u115))
 (define-constant ERR-EXPENSE-ALREADY-APPROVED (err u116))
 (define-constant ERR-INVALID-CATEGORY (err u117))
+(define-constant ERR-ACHIEVEMENT-NOT-FOUND (err u118))
+(define-constant ERR-ACHIEVEMENT-ALREADY-UNLOCKED (err u119))
+(define-constant ERR-INSUFFICIENT-REPUTATION (err u120))
+(define-constant ERR-INVALID-ACHIEVEMENT-TYPE (err u121))
 
 (define-constant PROPOSAL-STATUS-ACTIVE u1)
 (define-constant PROPOSAL-STATUS-EXECUTED u2)
@@ -35,6 +39,18 @@
 (define-constant EXPENSE-STATUS-APPROVED u2)
 (define-constant EXPENSE-STATUS-REJECTED u3)
 
+(define-constant ACHIEVEMENT-TYPE-MEETING-ATTENDANCE u1)
+(define-constant ACHIEVEMENT-TYPE-PROPOSAL-SUBMISSION u2)
+(define-constant ACHIEVEMENT-TYPE-VOTING-PARTICIPATION u3)
+(define-constant ACHIEVEMENT-TYPE-BUDGET-CONTRIBUTION u4)
+(define-constant ACHIEVEMENT-TYPE-LEADERSHIP u5)
+
+(define-constant REPUTATION-POINTS-MEETING-ATTEND u10)
+(define-constant REPUTATION-POINTS-PROPOSAL-CREATE u25)
+(define-constant REPUTATION-POINTS-VOTE-CAST u5)
+(define-constant REPUTATION-POINTS-TREASURY-CONTRIBUTE u15)
+(define-constant REPUTATION-POINTS-PROPOSAL-PASSED u50)
+
 (define-constant MIN-VOTING-DURATION u144)
 (define-constant MAX-VOTING-DURATION u4320)
 (define-constant MIN-QUORUM-PERCENTAGE u10)
@@ -47,6 +63,8 @@
 (define-data-var budget-counter uint u0)
 (define-data-var expense-counter uint u0)
 (define-data-var total-treasury-balance uint u0)
+(define-data-var achievement-counter uint u0)
+(define-data-var reputation-enabled bool true)
 
 (define-map proposals uint {
     id: uint,
@@ -136,6 +154,41 @@
 
 (define-map treasury-contributions principal uint)
 
+(define-map user-reputation principal {
+    total-points: uint,
+    meetings-attended: uint,
+    proposals-created: uint,
+    votes-cast: uint,
+    treasury-contributions: uint,
+    successful-proposals: uint,
+    current-streak: uint,
+    longest-streak: uint,
+    last-activity-block: uint,
+    reputation-level: uint
+})
+
+(define-map achievements uint {
+    id: uint,
+    name: (string-utf8 50),
+    description: (string-utf8 200),
+    achievement-type: uint,
+    threshold: uint,
+    points-reward: uint,
+    is-active: bool,
+    created-at: uint
+})
+
+(define-map user-achievements { user: principal, achievement-id: uint } {
+    unlocked-at: uint,
+    points-earned: uint
+})
+
+(define-map achievement-metadata uint {
+    total-unlocked: uint,
+    first-unlocked-by: (optional principal),
+    first-unlocked-at: (optional uint)
+})
+
 (define-public (create-meeting (title (string-utf8 100)) (description (string-utf8 500)) (scheduled-block uint) (duration-blocks uint))
     (let ((meeting-id (+ (var-get meeting-counter) u1))
           (current-block stacks-block-height))
@@ -189,7 +242,10 @@
         (match (map-get? meetings meeting-id)
             meeting (map-set meetings meeting-id (merge meeting { total-proposals: (+ (get total-proposals meeting) u1) }))
             false)
-        (ok proposal-id)))
+        (begin
+            (award-reputation-points tx-sender REPUTATION-POINTS-PROPOSAL-CREATE)
+            (increment-user-stat tx-sender "proposals-created")
+            (ok proposal-id))))
 
 (define-public (vote-on-proposal (proposal-id uint) (vote-type uint))
     (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
@@ -210,8 +266,11 @@
                    (if (is-eq vote-type u2)
                        (merge proposal { no-votes: (+ (get no-votes proposal) voter-power) })
                        (merge proposal { abstain-votes: (+ (get abstain-votes proposal) voter-power) })))))
-            (map-set proposals proposal-id updated-proposal)
-            (ok true))))
+                       (map-set proposals proposal-id updated-proposal)
+                       (begin
+                           (award-reputation-points tx-sender REPUTATION-POINTS-VOTE-CAST)
+                           (increment-user-stat tx-sender "votes-cast")
+                           (ok true)))))
 
 (define-public (finalize-proposal (proposal-id uint))
     (let ((proposal (unwrap! (map-get? proposals proposal-id) ERR-PROPOSAL-NOT-FOUND))
@@ -227,7 +286,10 @@
             (if (is-eq new-status PROPOSAL-STATUS-EXECUTED)
                 (begin
                     (try! (refund-proposal-deposit proposal-id))
-                    (ok { status: "executed", yes-percentage: yes-percentage }))
+                    (begin
+                        (award-reputation-points (get proposer proposal) REPUTATION-POINTS-PROPOSAL-PASSED)
+                        (increment-user-stat (get proposer proposal) "successful-proposals")
+                        (ok { status: "executed", yes-percentage: yes-percentage })))
                 (ok { status: "rejected", yes-percentage: yes-percentage })))))
 
 (define-public (join-meeting (meeting-id uint))
@@ -245,7 +307,10 @@
             attendee-count: (+ (get attendee-count meeting) u1),
             status: MEETING-STATUS-ACTIVE
         }))
-        (ok true)))
+        (begin
+            (award-reputation-points tx-sender REPUTATION-POINTS-MEETING-ATTEND)
+            (increment-user-stat tx-sender "meetings-attended")
+            (ok true))))
 
 (define-public (set-voting-power (user principal) (power uint))
     (begin
@@ -343,7 +408,10 @@
         (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
         (var-set total-treasury-balance (+ current-balance amount))
         (map-set treasury-contributions tx-sender (+ contributor-balance amount))
-        (ok true)))
+        (begin
+            (award-reputation-points tx-sender REPUTATION-POINTS-TREASURY-CONTRIBUTE)
+            (increment-user-stat tx-sender "treasury-contributions")
+            (ok true))))
 
 (define-public (create-budget (category (string-utf8 50)) (allocated-amount uint) (quarter uint) (description (string-utf8 200)))
     (let ((budget-id (+ (var-get budget-counter) u1))
@@ -546,3 +614,202 @@
     (match (map-get? budgets budget-id)
         budget (+ acc (get spent-amount budget))
         acc))
+
+(define-public (create-achievement (name (string-utf8 50)) (description (string-utf8 200)) (achievement-type uint) (threshold uint) (points-reward uint))
+    (let ((achievement-id (+ (var-get achievement-counter) u1))
+          (current-block stacks-block-height))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (and (>= achievement-type u1) (<= achievement-type u5)) ERR-INVALID-ACHIEVEMENT-TYPE)
+        (asserts! (> threshold u0) ERR-INVALID-AMOUNT)
+        (asserts! (> points-reward u0) ERR-INVALID-AMOUNT)
+        (asserts! (>= (len name) u1) ERR-INVALID-CATEGORY)
+        (map-set achievements achievement-id {
+            id: achievement-id,
+            name: name,
+            description: description,
+            achievement-type: achievement-type,
+            threshold: threshold,
+            points-reward: points-reward,
+            is-active: true,
+            created-at: current-block
+        })
+        (map-set achievement-metadata achievement-id {
+            total-unlocked: u0,
+            first-unlocked-by: none,
+            first-unlocked-at: none
+        })
+        (var-set achievement-counter achievement-id)
+        (ok achievement-id)))
+
+(define-public (unlock-achievement (achievement-id uint))
+    (let ((achievement (unwrap! (map-get? achievements achievement-id) ERR-ACHIEVEMENT-NOT-FOUND))
+          (user-rep (get-user-reputation-data tx-sender))
+          (current-block stacks-block-height)
+          (metadata (unwrap! (map-get? achievement-metadata achievement-id) ERR-ACHIEVEMENT-NOT-FOUND)))
+        (asserts! (get is-active achievement) ERR-ACHIEVEMENT-NOT-FOUND)
+        (asserts! (is-none (map-get? user-achievements { user: tx-sender, achievement-id: achievement-id })) ERR-ACHIEVEMENT-ALREADY-UNLOCKED)
+        (asserts! (can-unlock-achievement tx-sender achievement-id) ERR-INSUFFICIENT-REPUTATION)
+        (map-set user-achievements { user: tx-sender, achievement-id: achievement-id } {
+            unlocked-at: current-block,
+            points-earned: (get points-reward achievement)
+        })
+        (map-set achievement-metadata achievement-id (merge metadata {
+            total-unlocked: (+ (get total-unlocked metadata) u1),
+            first-unlocked-by: (if (is-none (get first-unlocked-by metadata)) (some tx-sender) (get first-unlocked-by metadata)),
+            first-unlocked-at: (if (is-none (get first-unlocked-at metadata)) (some current-block) (get first-unlocked-at metadata))
+        }))
+        (begin
+            (award-reputation-points tx-sender (get points-reward achievement))
+            (ok true))))
+
+(define-public (toggle-reputation-system (enabled bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (var-set reputation-enabled enabled)
+        (ok true)))
+
+(define-public (deactivate-achievement (achievement-id uint))
+    (let ((achievement (unwrap! (map-get? achievements achievement-id) ERR-ACHIEVEMENT-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (map-set achievements achievement-id (merge achievement { is-active: false }))
+        (ok true)))
+
+(define-private (award-reputation-points (user principal) (points uint))
+    (if (var-get reputation-enabled)
+        (let ((current-rep (get-user-reputation-data user))
+              (current-block stacks-block-height)
+              (new-total (+ (get total-points current-rep) points))
+              (new-level (calculate-reputation-level new-total)))
+            (map-set user-reputation user (merge current-rep {
+                total-points: new-total,
+                last-activity-block: current-block,
+                reputation-level: new-level
+            }))
+            true)
+        true))
+
+(define-private (increment-user-stat (user principal) (stat-type (string-ascii 30)))
+    (let ((current-rep (get-user-reputation-data user)))
+        (if (is-eq stat-type "meetings-attended")
+            (map-set user-reputation user (merge current-rep { meetings-attended: (+ (get meetings-attended current-rep) u1) }))
+            (if (is-eq stat-type "proposals-created")
+                (map-set user-reputation user (merge current-rep { proposals-created: (+ (get proposals-created current-rep) u1) }))
+                (if (is-eq stat-type "votes-cast")
+                    (map-set user-reputation user (merge current-rep { votes-cast: (+ (get votes-cast current-rep) u1) }))
+                    (if (is-eq stat-type "treasury-contributions")
+                        (map-set user-reputation user (merge current-rep { treasury-contributions: (+ (get treasury-contributions current-rep) u1) }))
+                        (if (is-eq stat-type "successful-proposals")
+                            (map-set user-reputation user (merge current-rep { successful-proposals: (+ (get successful-proposals current-rep) u1) }))
+                            false)))))
+        true))
+
+(define-private (calculate-reputation-level (total-points uint))
+    (if (>= total-points u1000) u5
+        (if (>= total-points u500) u4
+            (if (>= total-points u200) u3
+                (if (>= total-points u50) u2
+                    u1)))))
+
+(define-private (can-unlock-achievement (user principal) (achievement-id uint))
+    (match (map-get? achievements achievement-id)
+        achievement 
+            (let ((user-rep (get-user-reputation-data user))
+                  (achievement-type (get achievement-type achievement))
+                  (threshold (get threshold achievement)))
+                (if (is-eq achievement-type ACHIEVEMENT-TYPE-MEETING-ATTENDANCE)
+                    (>= (get meetings-attended user-rep) threshold)
+                    (if (is-eq achievement-type ACHIEVEMENT-TYPE-PROPOSAL-SUBMISSION)
+                        (>= (get proposals-created user-rep) threshold)
+                        (if (is-eq achievement-type ACHIEVEMENT-TYPE-VOTING-PARTICIPATION)
+                            (>= (get votes-cast user-rep) threshold)
+                            (if (is-eq achievement-type ACHIEVEMENT-TYPE-BUDGET-CONTRIBUTION)
+                                (>= (get treasury-contributions user-rep) threshold)
+                                (if (is-eq achievement-type ACHIEVEMENT-TYPE-LEADERSHIP)
+                                    (>= (get successful-proposals user-rep) threshold)
+                                    false))))))
+        false))
+
+(define-private (get-user-reputation-data (user principal))
+    (default-to {
+        total-points: u0,
+        meetings-attended: u0,
+        proposals-created: u0,
+        votes-cast: u0,
+        treasury-contributions: u0,
+        successful-proposals: u0,
+        current-streak: u0,
+        longest-streak: u0,
+        last-activity-block: u0,
+        reputation-level: u1
+    } (map-get? user-reputation user)))
+
+(define-read-only (get-user-reputation (user principal))
+    (get-user-reputation-data user))
+
+(define-read-only (get-achievement (achievement-id uint))
+    (map-get? achievements achievement-id))
+
+(define-read-only (get-user-achievement (user principal) (achievement-id uint))
+    (map-get? user-achievements { user: user, achievement-id: achievement-id }))
+
+(define-read-only (get-achievement-stats (achievement-id uint))
+    (match (map-get? achievement-metadata achievement-id)
+        metadata (ok {
+            achievement-id: achievement-id,
+            total-unlocked: (get total-unlocked metadata),
+            first-unlocked-by: (get first-unlocked-by metadata),
+            first-unlocked-at: (get first-unlocked-at metadata),
+            rarity-percentage: (if (> (var-get achievement-counter) u0) 
+                                 (* (/ (get total-unlocked metadata) (var-get achievement-counter)) u100) 
+                                 u0)
+        })
+        ERR-ACHIEVEMENT-NOT-FOUND))
+
+(define-read-only (get-user-achievements-count (user principal))
+    (let ((user-rep (get-user-reputation-data user)))
+        (ok {
+            total-achievements: (fold count-user-achievements (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0),
+            reputation-level: (get reputation-level user-rep),
+            total-points: (get total-points user-rep)
+        })))
+
+(define-read-only (get-leaderboard)
+    (ok {
+        top-contributors: (list 
+            { user: tx-sender, points: (get total-points (get-user-reputation-data tx-sender)) }
+        ),
+        total-registered-users: (fold count-active-users (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0)
+    }))
+
+(define-read-only (check-achievement-eligibility (user principal) (achievement-id uint))
+    (match (map-get? achievements achievement-id)
+        achievement 
+            (let ((can-unlock (can-unlock-achievement user achievement-id))
+                  (already-unlocked (is-some (map-get? user-achievements { user: user, achievement-id: achievement-id }))))
+                (ok {
+                    can-unlock: can-unlock,
+                    already-unlocked: already-unlocked,
+                    is-active: (get is-active achievement),
+                    threshold: (get threshold achievement),
+                    points-reward: (get points-reward achievement)
+                }))
+        ERR-ACHIEVEMENT-NOT-FOUND))
+
+(define-read-only (get-reputation-system-status)
+    (ok {
+        enabled: (var-get reputation-enabled),
+        total-achievements: (var-get achievement-counter),
+        total-users-with-reputation: (fold count-reputation-users (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) u0)
+    }))
+
+(define-private (count-user-achievements (achievement-id uint) (acc uint))
+    (if (is-some (map-get? user-achievements { user: tx-sender, achievement-id: achievement-id }))
+        (+ acc u1)
+        acc))
+
+(define-private (count-active-users (user-index uint) (acc uint))
+    (+ acc u1))
+
+(define-private (count-reputation-users (user-index uint) (acc uint))
+    (+ acc u1))
+
